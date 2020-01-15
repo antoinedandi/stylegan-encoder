@@ -22,6 +22,9 @@ def load_images(images_list, image_size=256):
 def tf_custom_l1_loss(img1,img2):
   return tf.math.reduce_mean(tf.math.abs(img2-img1), axis=None)
 
+def tf_custom_l2_loss(img1,img2):
+  return tf.math.reduce_mean(tf.math.square(img2-img1), axis=None)
+
 def tf_custom_logcosh_loss(img1,img2):
   return tf.math.reduce_mean(tf.keras.losses.logcosh(img1,img2))
 
@@ -47,10 +50,14 @@ class PerceptualModel:
         self.use_grabcut = args.use_grabcut
         self.scale_mask = args.scale_mask
         self.mask_dir = args.mask_dir
+        self.concurrent = args.concurrent
         if (self.layer <= 0 or self.vgg_loss <= self.epsilon):
             self.vgg_loss = None
         self.pixel_loss = args.use_pixel_loss
         if (self.pixel_loss <= self.epsilon):
+            self.pixel_loss = None
+        self.l2_pixel_loss = args.use_l2_pixel_loss
+        if (self.l2_pixel_loss <= self.epsilon):
             self.pixel_loss = None
         self.mssim_loss = args.use_mssim_loss
         if (self.mssim_loss <= self.epsilon):
@@ -67,9 +74,11 @@ class PerceptualModel:
         else:
             self.perc_model = None
         self.ref_img = None
+        self.ref_img_2 = None
         self.ref_weight = None
         self.perceptual_model = None
         self.ref_img_features = None
+        self.ref_img_features_2 = None
         self.features_weight = None
         self.loss = None
 
@@ -109,9 +118,14 @@ class PerceptualModel:
 
         self.ref_img = tf.get_variable('ref_img', shape=generated_image.shape,
                                                 dtype='float32', initializer=tf.initializers.zeros())
+        if self.concurrent:
+            self.ref_img_2 = tf.get_variable('ref_img_2', shape=generated_image.shape,
+                                                dtype='float32', initializer=tf.initializers.zeros())
+        ## For concurrent case, we'll just use the same ref_weight for both now
         self.ref_weight = tf.get_variable('ref_weight', shape=generated_image.shape,
                                                dtype='float32', initializer=tf.initializers.zeros())
         self.add_placeholder("ref_img")
+        self.add_placeholder("ref_img2")
         self.add_placeholder("ref_weight")
 
         if (self.vgg_loss is not None):
@@ -120,19 +134,26 @@ class PerceptualModel:
             generated_img_features = self.perceptual_model(preprocess_input(self.ref_weight * generated_image))
             self.ref_img_features = tf.get_variable('ref_img_features', shape=generated_img_features.shape,
                                                 dtype='float32', initializer=tf.initializers.zeros())
+            if self.concurrent:
+                self.ref_img_features = tf.get_variable('ref_img_features_2', shape=generated_img_features.shape,dtype='float32', initializer=tf.initializers.zeros())
             self.features_weight = tf.get_variable('features_weight', shape=generated_img_features.shape,
                                                dtype='float32', initializer=tf.initializers.zeros())
             self.sess.run([self.features_weight.initializer, self.features_weight.initializer])
             self.add_placeholder("ref_img_features")
+            self.add_placeholder("ref_img_features_2")
             self.add_placeholder("features_weight")
 
         self.loss = 0
+        self.loss_2 = 0
         # L1 loss on VGG16 features
         if (self.vgg_loss is not None):
             self.loss += self.vgg_loss * tf_custom_l1_loss(self.features_weight * self.ref_img_features, self.features_weight * generated_img_features)
         # + logcosh loss on image pixels
         if (self.pixel_loss is not None):
             self.loss += self.pixel_loss * tf_custom_logcosh_loss(self.ref_weight * self.ref_img, self.ref_weight * generated_image)
+        # + L2 loss on image pixels
+        if (self.l2_pixel_loss is not None):
+            self.loss += self.l2_pixel_loss * tf_custom_l2_loss(self.ref_weight * self.ref_img, self.ref_weight * generated_image)
         # + MS-SIM loss on image pixels
         if (self.mssim_loss is not None):
             self.loss += self.mssim_loss * tf.math.reduce_mean(1-tf.image.ssim_multiscale(self.ref_weight * self.ref_img, self.ref_weight * generated_image, 1))
@@ -142,6 +163,28 @@ class PerceptualModel:
         # + L1 penalty on dlatent weights
         if self.l1_penalty is not None:
             self.loss += self.l1_penalty * 512 * tf.math.reduce_mean(tf.math.abs(generator.dlatent_variable-generator.get_dlatent_avg()))
+
+        # Adding the loss for the 
+        if self.concurrent:
+        # L1 loss on VGG16 features
+            if (self.vgg_loss is not None):
+                self.loss_2 += self.vgg_loss * tf_custom_l1_loss(self.features_weight * self.ref_img_features_2, self.features_weight * generated_img_features)
+            # + logcosh loss on image pixels
+            if (self.pixel_loss is not None):
+                self.loss_2 += self.pixel_loss * tf_custom_logcosh_loss(self.ref_weight * self.ref_img_2, self.ref_weight * generated_image)
+            # + L2 loss on image pixels
+            if (self.l2_pixel_loss is not None):
+                self.loss_2 += self.l2_pixel_loss * tf_custom_l2_loss(self.ref_weight * self.ref_img_2, self.ref_weight * generated_image)
+            # + MS-SIM loss on image pixels
+            if (self.mssim_loss is not None):
+                self.loss_2 += self.mssim_loss * tf.math.reduce_mean(1-tf.image.ssim_multiscale(self.ref_weight * self.ref_img_, self.ref_weight * generated_image, 1))
+            # + extra perceptual loss on image pixels
+            if self.perc_model is not None and self.lpips_loss is not None:
+                self.loss_2 += self.lpips_loss * tf.math.reduce_mean(self.compare_images(self.ref_weight * self.ref_img_2, self.ref_weight * generated_image))
+            # + L1 penalty on dlatent weights
+            if self.l1_penalty is not None:
+                self.loss_2 += self.l1_penalty * 512 * tf.math.reduce_mean(tf.math.abs(generator.dlatent_variable-generator.get_dlatent_avg()))
+
 
     def generate_face_mask(self, im):
         from imutils import face_utils
@@ -233,13 +276,21 @@ class PerceptualModel:
         self.assign_placeholder("ref_weight", image_mask)
         self.assign_placeholder("ref_img", loaded_image)
 
-    def optimize(self, vars_to_optimize, iterations=200):
+
+    # TODO: Need to code the concurrent part.
+    # Problem: need to run concurrent sessions which share the same latent vector
+    # Sessions run independent of one another..
+    def optimize(self, vars_to_optimize, iterations=200, vars_to_optimize_2 = None):
         vars_to_optimize = vars_to_optimize if isinstance(vars_to_optimize, list) else [vars_to_optimize]
         optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate)
         min_op = optimizer.minimize(self.loss, var_list=[vars_to_optimize])
         self.sess.run(tf.variables_initializer(optimizer.variables()))
         self.sess.run(self._reset_global_step)
         fetch_ops = [min_op, self.loss, self.learning_rate]
+        if vars_ti_optimize_2 is not None:
+            vars_to_optimize_2 = vars_to_optimize_2 if isinstance(vars_to_optimize_2, list) else [vars_to_optimize_2]
+            min_op_2 = optimizer_minimize(self.loss_2, var_list=[vars_to_optimizer_2])
+
         for _ in range(iterations):
             _, loss, lr = self.sess.run(fetch_ops)
             yield {"loss":loss, "lr": lr}

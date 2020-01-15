@@ -20,7 +20,9 @@ def main():
     parser.add_argument('src_dir', help='Directory with images for encoding')
     parser.add_argument('generated_images_dir', help='Directory for storing generated images')
     parser.add_argument('dlatent_dir', help='Directory for storing dlatent representations')
+    # Huh?
     parser.add_argument('--data_dir', default='data', help='Directory for storing optional models')
+    # Huh??
     parser.add_argument('--mask_dir', default='masks', help='Directory for storing optional masks')
     parser.add_argument('--load_last', default='', help='Start with embeddings from directory')
     parser.add_argument('--dlatent_avg', default='', help='Use dlatent from file specified here for truncation instead of dlatent_avg from Gs')
@@ -42,6 +44,7 @@ def main():
     parser.add_argument('--use_vgg_loss', default=0.4, help='Use VGG perceptual loss; 0 to disable, > 0 to scale.', type=float)
     parser.add_argument('--use_vgg_layer', default=9, help='Pick which VGG layer to use.', type=int)
     parser.add_argument('--use_pixel_loss', default=1.5, help='Use logcosh image pixel loss; 0 to disable, > 0 to scale.', type=float)
+    parser.add_argument('--use_l2_pixel_loss', defaut=0, help'Use L2 image pixel loss; 0 to disable, >0 to scale.',type=float)
     parser.add_argument('--use_mssim_loss', default=100, help='Use MS-SIM perceptual loss; 0 to disable, > 0 to scale.', type=float)
     parser.add_argument('--use_lpips_loss', default=100, help='Use LPIPS perceptual loss; 0 to disable, > 0 to scale.', type=float)
     parser.add_argument('--use_l1_penalty', default=1, help='Use L1 penalty on latents; 0 to disable, > 0 to scale.', type=float)
@@ -49,6 +52,8 @@ def main():
     # Generator params
     parser.add_argument('--randomize_noise', default=False, help='Add noise to dlatents during optimization', type=bool)
     parser.add_argument('--tile_dlatents', default=False, help='Tile dlatents to use a single vector at each scale', type=bool)
+
+            ## Interesting
     parser.add_argument('--clipping_threshold', default=2.0, help='Stochastic clipping of gradient values outside of this threshold', type=float)
 
     # Masking params
@@ -57,21 +62,12 @@ def main():
     parser.add_argument('--use_grabcut', default=True, help='Use grabcut algorithm on the face mask to better segment the foreground', type=bool)
     parser.add_argument('--scale_mask', default=1.5, help='Look over a wider section of foreground for grabcut', type=float)
 
-    # Video params
-    parser.add_argument('--video_dir', default='videos', help='Directory for storing training videos')
-    parser.add_argument('--output_video', default=False, help='Generate videos of the optimization process', type=bool)
-    parser.add_argument('--video_codec', default='MJPG', help='FOURCC-supported video codec name')
-    parser.add_argument('--video_frame_rate', default=24, help='Video frames per second', type=int)
-    parser.add_argument('--video_size', default=512, help='Video size in pixels', type=int)
-    parser.add_argument('--video_skip', default=1, help='Only write every n frames (1 = write every frame)', type=int)
 
+    ## Idemia facemorphing parameters
+    parser.add_argument('--concurrent', default=False, help='Concurrently optimize the latent vector with respect to two images', type=bool)
     args, other_args = parser.parse_known_args()
 
     args.decay_steps *= 0.01 * args.iterations # Calculate steps as a percent of total iterations
-
-    if args.output_video:
-      import cv2
-      synthesis_kwargs = dict(output_transform=dict(func=tflib.convert_images_to_uint8, nchw_to_nhwc=False), minibatch_size=args.batch_size)
 
     ref_images = [os.path.join(args.src_dir, x) for x in os.listdir(args.src_dir)]
     ref_images = list(filter(os.path.isfile, ref_images))
@@ -83,7 +79,6 @@ def main():
     os.makedirs(args.mask_dir, exist_ok=True)
     os.makedirs(args.generated_images_dir, exist_ok=True)
     os.makedirs(args.dlatent_dir, exist_ok=True)
-    os.makedirs(args.video_dir, exist_ok=True)
 
     # Initialize generator and perceptual model
     tflib.init_tf()
@@ -106,10 +101,6 @@ def main():
     # Optimize (only) dlatents by minimizing perceptual loss between reference and generated images in feature space
     for images_batch in tqdm(split_to_batches(ref_images, args.batch_size), total=len(ref_images)//args.batch_size):
         names = [os.path.splitext(os.path.basename(x))[0] for x in images_batch]
-        if args.output_video:
-          video_out = {}
-          for name in names:
-            video_out[name] = cv2.VideoWriter(os.path.join(args.video_dir, f'{name}.avi'),cv2.VideoWriter_fourcc(*args.video_codec), args.video_frame_rate, (args.video_size,args.video_size))
 
         perceptual_model.set_reference_images(images_batch)
         dlatents = None
@@ -147,17 +138,8 @@ def main():
             if best_loss is None or loss_dict["loss"] < best_loss:
                 best_loss = loss_dict["loss"]
                 best_dlatent = generator.get_dlatents()
-            if args.output_video and (vid_count % args.video_skip == 0):
-              batch_frames = generator.generate_images()
-              for i, name in enumerate(names):
-                video_frame = PIL.Image.fromarray(batch_frames[i], 'RGB').resize((args.video_size,args.video_size),PIL.Image.LANCZOS)
-                video_out[name].write(cv2.cvtColor(np.array(video_frame).astype('uint8'), cv2.COLOR_RGB2BGR))
             generator.stochastic_clip_dlatents()
         print(" ".join(names), " Loss {:.4f}".format(best_loss))
-
-        if args.output_video:
-            for name in names:
-                video_out[name].release()
 
         # Generate images from found dlatents and save them
         generator.set_dlatents(best_dlatent)
